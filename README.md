@@ -1,6 +1,8 @@
 <div align="center">
 
-# ProFam: Open-Source Protein Family Language Modeling for Fitness Prediction and Design
+<img src="data/profam_logo_grey.png" alt="ProFam logo" width="800" />
+
+# ProFam: Open-Source Protein Family Language Modelling for Fitness Prediction and Design
 
 
 </div>
