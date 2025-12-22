@@ -38,6 +38,12 @@ uv pip install -r requirements-dev.txt
 python scripts/hf_download_checkpoint.py
 ```
 
+### CPU-only installation (no GPU)
+
+```bash
+uv pip install -r requirements-cpu.txt --index-strategy unsafe-best-match
+```
+
 ### (Recommended) `flash-attn` 2
 
 We **recommend installing FlashAttention 2** it should make (scoring and generating sequences) faster, but these inference pipelines will work fine without it.
