@@ -41,7 +41,7 @@ python scripts/hf_download_checkpoint.py
 ### CPU-only installation (no GPU)
 
 ```bash
-uv pip install -r requirements-cpu.txt
+uv pip install -r requirements-cpu.txt --index-strategy unsafe-best-match
 ```
 
 ### (Recommended) `flash-attn` 2
