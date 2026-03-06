@@ -776,8 +776,15 @@ class BaseFamilyLitModule(LightningModule):
         consistently regardless of batch size.
         """
         generation_kwargs = self._build_generation_kwargs(
-            input_ids, max_tokens, max_generated_length, max_total_length,
-            fixed_length, top_p, sample_gaps, structure_tokens, continuous_sampling,
+            input_ids,
+            max_tokens,
+            max_generated_length,
+            max_total_length,
+            fixed_length,
+            top_p,
+            sample_gaps,
+            structure_tokens,
+            continuous_sampling,
         )
 
         assert (
@@ -852,12 +859,17 @@ class BaseFamilyLitModule(LightningModule):
                 for i in range(current_batch_size):
                     row = seqs[i]
                     is_valid = continuous_sampling or self._validate_generated_sequence(
-                        row, repeat_guard, repeat_length, repeat_count,
+                        row,
+                        repeat_guard,
+                        repeat_length,
+                        repeat_count,
                     )
 
                     if is_valid or budget_exhausted:
                         score = self._score_generated_sequence(
-                            row, selected_log_probs[i], T,
+                            row,
+                            selected_log_probs[i],
+                            T,
                         )
                         all_outputs.append(row.unsqueeze(0))
                         all_scores.append(score)

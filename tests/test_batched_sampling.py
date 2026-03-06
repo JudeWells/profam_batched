@@ -28,6 +28,7 @@ def prompt_ids(profam_tokenizer, test_model):
     input_ids = torch.as_tensor(tok["input_ids"], dtype=torch.long).unsqueeze(0)
     return input_ids.to(test_model.device)
 
+
 @pytest.fixture()
 def prompt_ids_repeaty(profam_tokenizer, test_model):
     """Build a prompt that strongly encourages the model to generate repeats."""
@@ -58,12 +59,12 @@ class TestBatchedSamplingCorrectness:
                 batch_generation=True,
                 generation_batch_size=3,
             )
-        assert outputs.shape[0] == num_samples, (
-            f"Expected {num_samples} sequences, got {outputs.shape[0]}"
-        )
-        assert len(scores) == num_samples, (
-            f"Expected {num_samples} scores, got {len(scores)}"
-        )
+        assert (
+            outputs.shape[0] == num_samples
+        ), f"Expected {num_samples} sequences, got {outputs.shape[0]}"
+        assert (
+            len(scores) == num_samples
+        ), f"Expected {num_samples} scores, got {len(scores)}"
 
     def test_output_shape_matches_sequential(self, test_model, prompt_ids):
         """Batched and sequential should return tensors with the same first dim."""
@@ -109,9 +110,7 @@ class TestBatchedSamplingCorrectness:
         for i in range(num_samples):
             row = outputs[i]
             non_pad = row[row != pad_id]
-            assert len(non_pad) >= 3, (
-                f"Sequence {i} too short: {len(non_pad)} tokens"
-            )
+            assert len(non_pad) >= 3, f"Sequence {i} too short: {len(non_pad)} tokens"
             # Decode and check
             decoded = tokenizer.decode(non_pad.tolist(), skip_special_tokens=True)
             decoded = decoded.replace(" ", "")
@@ -206,9 +205,7 @@ class TestBatchedSamplingCorrectness:
             # Full sequence = prompt + generated tokens
             full_seq = torch.cat([prompt_ids[0], gen_tokens]).unsqueeze(0)
             with torch.no_grad():
-                model_out = test_model.model(
-                    input_ids=full_seq, use_cache=False
-                )
+                model_out = test_model.model(input_ids=full_seq, use_cache=False)
             logits = model_out.logits[0]  # (L_total, V)
 
             total_logp = 0.0
@@ -459,7 +456,9 @@ class TestSamplingConstraints:
             decoded = tokenizer.decode(
                 row[:valid_len].tolist(), skip_special_tokens=True
             ).replace(" ", "")
-            ends_sep = int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            ends_sep = (
+                int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            )
             print(
                 f"  Seq {i} ({len(decoded)} aa, ends_sep={ends_sep}, "
                 f"score={scores[i]:.4f}): {decoded[:80]}"
@@ -492,14 +491,18 @@ class TestSamplingConstraints:
         assert outputs.shape[0] == num_samples
         assert len(scores) == num_samples
 
-        print("\n--- Repeat Guard Test SEQUENTIAL (repeaty prompt, length=1, count=3) ---")
+        print(
+            "\n--- Repeat Guard Test SEQUENTIAL (repeaty prompt, length=1, count=3) ---"
+        )
         for i in range(num_samples):
             row = outputs[i]
             valid_len = int((row != pad_id).sum().item())
             decoded = tokenizer.decode(
                 row[:valid_len].tolist(), skip_special_tokens=True
             ).replace(" ", "")
-            ends_sep = int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            ends_sep = (
+                int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            )
             print(
                 f"  Seq {i} ({len(decoded)} aa, ends_sep={ends_sep}, "
                 f"score={scores[i]:.4f}): {decoded[:80]}"
@@ -536,7 +539,9 @@ class TestSamplingConstraints:
             decoded = tokenizer.decode(
                 row[:valid_len].tolist(), skip_special_tokens=True
             ).replace(" ", "")
-            ends_sep = int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            ends_sep = (
+                int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            )
             print(
                 f"  Seq {i} ({len(decoded)} aa, ends_sep={ends_sep}, "
                 f"score={scores[i]:.4f}): {decoded}"
@@ -571,7 +576,9 @@ class TestSamplingConstraints:
             decoded = tokenizer.decode(
                 row[:valid_len].tolist(), skip_special_tokens=True
             ).replace(" ", "")
-            ends_sep = int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            ends_sep = (
+                int(row[valid_len - 1].item()) == sep_id if valid_len > 0 else False
+            )
             print(
                 f"  Seq {i} ({len(decoded)} aa, ends_sep={ends_sep}, "
                 f"score={scores[i]:.4f}): {decoded}"

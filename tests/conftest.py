@@ -90,9 +90,7 @@ def test_model(profam_tokenizer):
         hyper_params = ckpt_blob.get("hyper_parameters", {})
         cfg_obj = hyper_params.get("config", None)
         if cfg_obj is None:
-            raise RuntimeError(
-                "Could not find 'config' in checkpoint hyper_parameters"
-            )
+            raise RuntimeError("Could not find 'config' in checkpoint hyper_parameters")
         attn_impl = "sdpa" if device == "cuda" else "eager"
         setattr(cfg_obj, "attn_implementation", attn_impl)
         setattr(cfg_obj, "_attn_implementation", attn_impl)
