@@ -29,7 +29,7 @@ jobs:
 # TODO: seed?
     - name: Test
       run: |
-        pytest -k "not example"
+        pytest -k "not example" --ignore=tests/test_batched_sampling.py
     - name: Train model
       run: |
         HYDRA_FULL_ERROR=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \

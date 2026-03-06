@@ -8,6 +8,12 @@ import torch
 from hydra import compose, initialize, initialize_config_dir
 
 from src.constants import BASEDIR
+from src.models.llama import LlamaLitModule
+
+# Checkpoint path for optional pre-trained model (fallback: randomly initialized)
+PROFAM_CHECKPOINT_PATH = os.path.join(
+    BASEDIR, "model_checkpoints/profam-1/checkpoints/last.ckpt"
+)
 from src.data.collators import DocumentBatchCollator
 from src.data.objects import ProteinDocument
 from src.data.processors import preprocessing, transforms
@@ -74,6 +80,34 @@ def test_model_noseqpos(profam_tokenizer_noseqpos):
 
 @pytest.fixture(scope="package")
 def test_model(profam_tokenizer):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if os.path.exists(PROFAM_CHECKPOINT_PATH):
+        # Load pre-trained ProFam model from checkpoint
+        ckpt_blob = torch.load(
+            PROFAM_CHECKPOINT_PATH, map_location=device, weights_only=False
+        )
+        hyper_params = ckpt_blob.get("hyper_parameters", {})
+        cfg_obj = hyper_params.get("config", None)
+        if cfg_obj is None:
+            raise RuntimeError(
+                "Could not find 'config' in checkpoint hyper_parameters"
+            )
+        attn_impl = "sdpa" if device == "cuda" else "eager"
+        setattr(cfg_obj, "attn_implementation", attn_impl)
+        setattr(cfg_obj, "_attn_implementation", attn_impl)
+        model = LlamaLitModule.load_from_checkpoint(
+            PROFAM_CHECKPOINT_PATH,
+            config=cfg_obj,
+            tokenizer=profam_tokenizer,
+            strict=False,
+            map_location=device,
+        )
+        model.to(device)
+        model.eval()
+        return model
+
+    # Fallback: lightweight randomly-initialized model for fast tests
     with initialize(config_path="../configs", version_base="1.3"):
         cfg = compose(
             config_name="train.yaml",
@@ -94,7 +128,9 @@ def test_model(profam_tokenizer):
                 "model.config.attn_implementation=null",
             ],
         )
-    return hydra.utils.instantiate(cfg.model, tokenizer=profam_tokenizer)
+    model = hydra.utils.instantiate(cfg.model, tokenizer=profam_tokenizer)
+    model.to(device)
+    return model
 
 
 @pytest.fixture(scope="package")
