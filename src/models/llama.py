@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
-from src.models.base import BaseFamilyLitModule
+from src.models.base_batched import BaseFamilyLitModule
 
 
 class LlamaLitModule(BaseFamilyLitModule):

@@ -105,11 +105,6 @@ class BaseFamilyLitModule(LightningModule):
         grpo_use_reference_model: bool = False,  # Use KL regularization to initial model
         grpo_reward_baseline: str = "mean",  # "mean", "min", or "none"
         grpo_max_tokens: int = 8_000,  # Max tokens per batch for GRPO (lower than scoring_max_tokens due to gradients)
-        # Online HMM GRPO sampling parameters
-        grpo_hmm_temperature: float = 1.0,
-        grpo_hmm_top_p: Optional[float] = None,
-        grpo_hmm_max_generated_length: Optional[int] = None,
-        grpo_hmm_length_penalty: float = 0.1,  # Per-residue penalty for seq length > HMM model length M
     ):
         super().__init__()
 
@@ -143,40 +138,6 @@ class BaseFamilyLitModule(LightningModule):
         self.grpo_max_tokens = (
             grpo_max_tokens  # Separate limit for GRPO (needs gradients)
         )
-
-        # Online HMM GRPO sampling parameters
-        self.grpo_hmm_temperature = grpo_hmm_temperature
-        self.grpo_hmm_top_p = grpo_hmm_top_p
-        self.grpo_hmm_max_generated_length = grpo_hmm_max_generated_length
-        self.grpo_hmm_length_penalty = grpo_hmm_length_penalty
-
-        # HMM reward scorer (set during on_fit_start from datamodule)
-        self._hmm_scorer = None
-
-        # PETase training components (set by setup_petase_training)
-        self._petase_folder = None
-        self._petase_energy_functions = None
-        self._petase_template_residues = None
-
-        # Mipa GRPO training components (set by setup_mipa_training)
-        self._mipa_tm_scorer = None
-        self._mipa_folder = None
-        self._mipa_reasoning_mode = False
-        self._mipa_num_reasoning_seqs = 3
-        self._mipa_max_length = 400
-        self._mipa_max_tokens = 600
-        self._mipa_temperature = 1.0
-        self._mipa_plddt_weight = 0.1
-        self._mipa_length_penalty_threshold = 1048
-
-        # Evolving prompt state for MIPA GRPO training
-        self._evolving_prompt_enabled = False
-        self._evolving_prompt_update_interval = 250
-        self._evolving_prompt_min_tm_score = 0.3
-        self._evolving_prompt_current_sequence = None  # Current evolved prompt (str)
-        self._evolving_prompt_current_tokens = None  # Current prompt tokens (tensor)
-        self._evolving_prompt_current_reward = None  # Reward of current prompt (for monotonic evolution)
-        self._evolving_prompt_candidate_buffer = []  # Buffer of candidate sequences
 
         # Reference model for KL regularization (initialized lazily if needed)
         self._reference_model = None
@@ -281,18 +242,6 @@ class BaseFamilyLitModule(LightningModule):
                 # Keep reference deterministic (no dropout) and frozen.
                 self._reference_model.eval()
 
-        # Pick up HMM scorer from datamodule (set by PfamHMMGRPODataset)
-        if self._hmm_scorer is None and self.grpo_enabled:
-            dm = getattr(self.trainer, "datamodule", None)
-            if dm is not None:
-                scorer = getattr(dm, "hmm_scorer", None)
-                if scorer is not None:
-                    self._hmm_scorer = scorer
-                    log.info(
-                        f"HMM reward scorer attached with families: "
-                        f"{scorer.available_families}"
-                    )
-
     def on_train_batch_start(self, batch, batch_idx: int):
         self._t0 = time.time()
 
@@ -322,20 +271,8 @@ class BaseFamilyLitModule(LightningModule):
         # uncomment for debugging ddp (train.py +experiment=ddp_test)
         # print(f"Rank: {self.trainer.global_rank}", batch["identifier"].text, flush=True)
 
-        # Check if this is an online HMM GRPO batch
-        if "hmm_family_id" in batch and self.grpo_enabled:
-            return self.online_grpo_training_step(batch, batch_idx)
-
-        # Check if this is a PETase GRPO batch (online reward computation)
-        if batch.get("is_petase_batch", False) and self.grpo_enabled:
-            return self.petase_grpo_training_step(batch, batch_idx)
-
-        # Check if this is a Mipa GRPO batch (TM-score reward computation)
-        if batch.get("is_mipa_batch", False) and self.grpo_enabled:
-            return self.mipa_grpo_training_step(batch, batch_idx)
-
-        # Check if this is a GRPO batch (contains DMS_scores - offline rewards)
-        if "DMS_scores" in batch and self.grpo_enabled:
+        # Check if this is a GRPO batch (contains rewards or DMS_scores)
+        if ("rewards" in batch or "DMS_scores" in batch) and self.grpo_enabled:
             return self.grpo_training_step(batch, batch_idx)
 
         outputs = self(
@@ -564,46 +501,166 @@ class BaseFamilyLitModule(LightningModule):
 
         return torch.cat(all_log_probs, dim=0), torch.cat(all_masks, dim=0)
 
+    def grpo_step_from_rewards(
+        self,
+        input_ids: torch.Tensor,
+        generated_tokens: torch.Tensor,
+        old_per_token_lps: torch.Tensor,
+        old_per_token_mask: torch.Tensor,
+        rewards: torch.Tensor,
+        clip_ratio: Optional[float] = None,
+        beta: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Generic GRPO gradient computation from pre-computed rewards.
+
+        Takes pre-generated sequences (from ``_sample_seqs`` with
+        ``return_per_token_log_probs=True``) and pre-computed reward scores,
+        then computes the PPO-clipped GRPO loss with optional KL
+        regularization.
+
+        This is the reward-agnostic core of GRPO.  Callers are responsible
+        for generating sequences, computing rewards, and calling
+        ``loss.backward()`` / ``optimizer.step()`` on the returned loss.
+
+        Args:
+            input_ids: Context tokens of shape ``(1, L_context)``.
+            generated_tokens: Token IDs from ``_sample_seqs``, shape ``(G, L_gen)``.
+            old_per_token_lps: Per-token log-probs under the generating policy,
+                shape ``(G, L_gen)``.
+            old_per_token_mask: Validity mask, shape ``(G, L_gen)``.
+            rewards: Pre-computed reward scores, shape ``(G,)``.  Higher is better.
+            clip_ratio: PPO clipping epsilon.  Defaults to ``self.grpo_clip_ratio``.
+            beta: KL penalty coefficient.  Defaults to ``self.grpo_beta``.
+
+        Returns:
+            total_loss: Scalar loss tensor (with gradients).
+            metrics: Dict with ``grpo_loss``, ``kl_loss``, ``total_loss``,
+                ``mean_reward``, ``max_reward``, ``min_reward``,
+                ``mean_advantage``, ``clip_fraction``, ``mean_ratio``.
+        """
+        eps = clip_ratio if clip_ratio is not None else self.grpo_clip_ratio
+        kl_beta = beta if beta is not None else self.grpo_beta
+        sep_id = self.tokenizer.sep_token_id
+
+        # 1. Compute advantages
+        advantages = self._compute_grpo_advantages(rewards)
+
+        # 2. Format completion IDs: strip trailing SEP from context,
+        #    prepend SEP to each generated completion.
+        input_ids_dev = input_ids.to(self.device)
+        if input_ids_dev.shape[1] > 0 and int(input_ids_dev[0, -1].item()) == sep_id:
+            input_ids_for_scoring = input_ids_dev[:, :-1]
+        else:
+            input_ids_for_scoring = input_ids_dev
+
+        gen_on_device = generated_tokens.to(self.device)
+        sep_prefix = torch.full(
+            (gen_on_device.shape[0], 1), sep_id,
+            dtype=gen_on_device.dtype, device=self.device,
+        )
+        completion_ids = torch.cat([sep_prefix, gen_on_device], dim=1)
+        completion_ids = completion_ids.unsqueeze(0)  # (1, G, 1+L_gen)
+
+        # 3. Compute per-token log π_θ under current policy (with gradients)
+        new_per_token_lps, new_per_token_mask = (
+            self._compute_per_token_log_probs_for_grpo(
+                input_ids=input_ids_for_scoring,
+                completion_ids=completion_ids,
+            )
+        )
+
+        # 4. PPO-style clipped loss
+        old_lps = old_per_token_lps.to(self.device).detach()
+        valid_mask = old_per_token_mask.to(self.device) & new_per_token_mask
+
+        per_token_log_ratio = new_per_token_lps - old_lps
+        per_token_ratio = torch.exp(per_token_log_ratio)
+
+        clipped_ratio = torch.clamp(per_token_ratio, 1.0 - eps, 1.0 + eps)
+
+        adv = advantages.unsqueeze(1)  # (G, 1)
+        surr1 = per_token_ratio * adv
+        surr2 = clipped_ratio * adv
+        per_token_obj = torch.min(surr1, surr2)
+
+        num_valid = valid_mask.float().sum(dim=1).clamp(min=1)
+        per_seq_obj = (per_token_obj * valid_mask.float()).sum(dim=1) / num_valid
+        grpo_loss = -per_seq_obj.mean()
+
+        # 5. Optional KL regularization to frozen reference model
+        kl_loss = torch.tensor(0.0, device=grpo_loss.device)
+        if self.grpo_use_reference_model and kl_beta > 0:
+            ref_model = self._get_reference_model()
+            if ref_model is not None:
+                kl_loss = self._compute_token_level_kl_divergence(
+                    ref_model=ref_model,
+                    input_ids=input_ids_for_scoring,
+                    completion_ids=completion_ids,
+                    group_indices=list(range(completion_ids.shape[1])),
+                )
+
+        total_loss = grpo_loss + kl_beta * kl_loss
+
+        # 6. Compute metrics (no gradients needed)
+        with torch.no_grad():
+            ratio_valid = per_token_ratio.detach()[valid_mask]
+            clip_frac = (
+                ((ratio_valid < 1.0 - eps) | (ratio_valid > 1.0 + eps))
+                .float().mean().item()
+            ) if ratio_valid.numel() > 0 else 0.0
+            mean_ratio = ratio_valid.mean().item() if ratio_valid.numel() > 0 else 1.0
+
+        metrics = {
+            "grpo_loss": grpo_loss.item(),
+            "kl_loss": kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+            "total_loss": total_loss.item(),
+            "mean_reward": rewards.mean().item(),
+            "max_reward": rewards.max().item(),
+            "min_reward": rewards.min().item(),
+            "mean_advantage": advantages.mean().item(),
+            "clip_fraction": clip_frac,
+            "mean_ratio": mean_ratio,
+        }
+
+        return total_loss, metrics
+
     def grpo_training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
-        """GRPO training step for ProteinGym data.
+        """GRPO training step for batches with pre-computed rewards.
 
-        This implements Group Relative Policy Optimization where:
-        1. Compute advantages from ALL DMS scores (rewards) in the assay
+        Accepts any batch containing pre-computed reward scores alongside
+        variant sequences.  Implements Group Relative Policy Optimization:
+        1. Compute advantages from ALL rewards (before subsampling)
         2. Sample a group of variants for gradient computation
         3. Compute log-likelihoods for sampled variants under current policy
         4. Update policy to increase likelihood of high-reward variants
-
-        Note: Advantages are computed on ALL variants before subsampling to ensure
-        consistent advantage estimates regardless of which variants are sampled.
-
-        The loss is only computed on the variant sequences (last sequence in document),
-        not on the MSA context.
 
         Args:
             batch: Dictionary containing:
                 - input_ids: MSA context tokens (1, L_context)
                 - completion_ids: Variant tokens (1, N, L_completion)
-                - DMS_scores: Fitness scores (1, N)
-                - DMS_id: Assay identifier
+                - rewards: Reward scores (1, N) or (N,).
+                  Also accepts ``DMS_scores`` as a backward-compatible alias.
             batch_idx: Batch index
 
         Returns:
             loss: GRPO loss value
         """
-        assert "DMS_scores" in batch, "GRPO training requires DMS_scores in batch"
-
         input_ids = batch["input_ids"]  # (1, L_context)
         completion_ids = batch["completion_ids"]  # (1, N, L_completion)
-        dms_scores = batch["DMS_scores"]  # (1, N)
+
+        # Accept either "rewards" or "DMS_scores" key
+        raw_rewards = batch.get("rewards", batch.get("DMS_scores"))
+        assert raw_rewards is not None, (
+            "GRPO training requires 'rewards' or 'DMS_scores' in batch"
+        )
 
         # Flatten batch dimension for scores
-        rewards = dms_scores[0].float()  # (N,)
+        rewards = raw_rewards[0].float() if raw_rewards.dim() > 1 else raw_rewards.float()
         N = rewards.shape[0]
 
         # Compute advantages from ALL rewards (before subsampling)
-        # This ensures consistent advantage estimates regardless of which variants are sampled
         all_advantages = self._compute_grpo_advantages(rewards)
 
         # Sample a group of variants if we have more than grpo_group_size
@@ -621,19 +678,14 @@ class BaseFamilyLitModule(LightningModule):
             group_indices=group_indices,
         )
 
-        # Compute GRPO loss: -E[advantage * log_prob]
-        # This encourages higher likelihood for higher-reward variants
+        # GRPO loss: -E[advantage * log_prob]
         grpo_loss = -(advantages.to(log_likelihoods.device) * log_likelihoods).mean()
 
-        # Optional: Add KL regularization to reference model
-        # Uses proper token-level KL divergence over the full vocabulary distribution
+        # Optional KL regularization to reference model
         kl_loss = torch.tensor(0.0, device=grpo_loss.device)
         if self.grpo_use_reference_model and self.grpo_beta > 0:
             ref_model = self._get_reference_model()
             if ref_model is not None:
-                # Compute proper token-level KL divergence: D_KL(policy || reference)
-                # This compares the full vocabulary distribution at each position,
-                # not just the log-likelihood of observed tokens
                 kl_loss = self._compute_token_level_kl_divergence(
                     ref_model=ref_model,
                     input_ids=input_ids,
@@ -641,526 +693,26 @@ class BaseFamilyLitModule(LightningModule):
                     group_indices=group_indices,
                 )
 
-        # Total loss
         total_loss = grpo_loss + self.grpo_beta * kl_loss
 
         # Logging
-        self.log(
-            "train/grpo_loss",
-            grpo_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/grpo_kl_loss",
-            kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/grpo_total_loss",
-            total_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/grpo_mean_advantage",
-            advantages.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/grpo_mean_log_likelihood",
-            log_likelihoods.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/grpo_group_size",
-            float(len(group_indices)),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
+        self.log("train/grpo_loss", grpo_loss.item(),
+                 on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/grpo_kl_loss",
+                 kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("train/grpo_total_loss", total_loss.item(),
+                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("train/grpo_mean_advantage", advantages.mean().item(),
+                 on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        self.log("train/grpo_mean_log_likelihood", log_likelihoods.mean().item(),
+                 on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        self.log("train/grpo_group_size", float(len(group_indices)),
+                 on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
-        # Compute and log correlations between log_likelihoods and advantages
-        ll_np = log_likelihoods.detach().cpu().float().numpy()
-        adv_np = advantages.detach().cpu().float().numpy()
-
-        # Only compute correlations if there's variance in both arrays
-        if ll_np.std() > 1e-8 and adv_np.std() > 1e-8:
-            spearman_corr, _ = spearmanr(ll_np, adv_np)
-            pearson_corr, _ = pearsonr(ll_np, adv_np)
-        else:
-            spearman_corr = 0.0
-            pearson_corr = 0.0
-
-        self.log(
-            "train/grpo_ll_advantage_spearman",
-            spearman_corr,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/grpo_ll_advantage_pearson",
-            pearson_corr,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
-        # Log dataset sample counts
-        self.log_train_dataset_sample_counts(batch)
-
-        return total_loss
-
-    def online_grpo_training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        """Online GRPO training step using HMM profile rewards.
-
-        Implements proper Group Relative Policy Optimization (PPO-style) where:
-          1. Generate G sequences from the current (old) policy π_old.
-          2. Score them against a Pfam HMM profile to get rewards.
-          3. Compute group-relative advantages Aᵢ.
-          4. Re-compute log π_θ(yᵢ|x) under the *current* policy (with gradients).
-          5. Form the importance ratio  rᵢ = π_θ / π_old  and apply PPO clipping:
-                L = −E[min(rᵢ·Aᵢ, clip(rᵢ, 1−ε, 1+ε)·Aᵢ)]
-          6. Optionally add a KL penalty to a frozen reference model.
-
-        Args:
-            batch: Dictionary containing:
-                - input_ids: MSA context tokens (1, L_context)
-                - hmm_family_id: StringObject with the Pfam family ID
-            batch_idx: Batch index
-
-        Returns:
-            loss: GRPO loss value
-        """
-        assert self._hmm_scorer is not None, (
-            "HMM reward scorer not available. Ensure a PfamHMMGRPODataset is "
-            "included in the data config and grpo_enabled=True."
-        )
-
-        input_ids = batch["input_ids"]  # (1, L_context)
-        family_id = batch["hmm_family_id"].text[0]
-
-        # ------------------------------------------------------------------
-        # Step 1: Generate sequences from current policy (no gradients)
-        # ------------------------------------------------------------------
-        sampling_kwargs = {}
-        if self.grpo_hmm_temperature is not None:
-            sampling_kwargs["temperature"] = self.grpo_hmm_temperature
-        if self.grpo_hmm_top_p is not None:
-            sampling_kwargs["top_p"] = self.grpo_hmm_top_p
-        sep_id = self.tokenizer.sep_token_id
-        if self.grpo_hmm_max_generated_length is not None:
-            max_generated_length = self.grpo_hmm_max_generated_length
-        else:
-            sep_positions = torch.where(input_ids == sep_id)[1]
-            sequence_lengths = torch.diff(sep_positions, prepend=sep_positions.new_zeros(1))
-            max_generated_length = int(sequence_lengths.max().item() * 1.2)
-        with torch.no_grad():
-            generated_tokens, gen_scores, old_per_token_lps, old_per_token_mask = (
-                self._sample_seqs(
-                    input_ids,
-                    num_samples=self.grpo_group_size,
-                    max_tokens=self.grpo_max_tokens,
-                    max_generated_length=max_generated_length,
-                    repeat_guard=True,
-                    suppress_bad_words=False,  # use raw logits so gen_scores match scoring path
-                    return_per_token_log_probs=True,
-                    max_retries=0,
-                    **sampling_kwargs,
-                )
-            )
-            # generated_tokens: (G, L_gen) — on CPU
-            # gen_scores: List[float] of length G — mean per-token log-probs (for logging)
-            # old_per_token_lps: (G, L_gen) — per-token log-probs under π_old
-            # old_per_token_mask: (G, L_gen) — True for valid (non-pad) tokens
-
-        # ------------------------------------------------------------------
-        # Step 2: Decode to amino acid strings and score with HMM
-        # ------------------------------------------------------------------
-        generated_seqs = self.tokenizer.decode_tokens(
-            generated_tokens.to(self.device)
-        )
-        print(generated_seqs[0])
-        # decode_tokens returns List[str] when each row has a single sequence
-        if isinstance(generated_seqs[0], list):
-            generated_seqs = [s[0] if s else "" for s in generated_seqs]
-
-        rewards_np = self._hmm_scorer.score_sequences(
-            family_id,
-            generated_seqs,
-            length_penalty=self.grpo_hmm_length_penalty,
-        )
-        rewards = torch.tensor(rewards_np, dtype=torch.float32, device=self.device)
-
-        # ------------------------------------------------------------------
-        # Step 2b: Apply reward penalties for bad tokens and missing [SEP]
-        # ------------------------------------------------------------------
-        pad_id = self.tokenizer.pad_token_id
-        bad_token_ids = set()
-        for ch in "XxBJOUZbjou":
-            tid = self.tokenizer.convert_tokens_to_ids(ch)
-            if tid != self.tokenizer.unk_token_id:
-                bad_token_ids.add(tid)
-        # lowercase AA tokens (structure tokens)
-        for ch in aa_letters_lower:
-            tid = self.tokenizer.convert_tokens_to_ids(ch)
-            if tid != self.tokenizer.unk_token_id:
-                bad_token_ids.add(tid)
-        # special tokens that should never appear mid-sequence
-        for tid in self.tokenizer.all_special_ids:
-            if tid not in (sep_id, pad_id):
-                bad_token_ids.add(tid)
-
-        bad_token_penalty = 5.0   # per bad token found in a sequence
-        no_sep_penalty = 20.0     # for sequences that never generated [SEP]
-
-        penalty_applied = torch.zeros_like(rewards)
-        for i in range(generated_tokens.shape[0]):
-            row = generated_tokens[i]
-            # Check for missing [SEP] (sequence didn't terminate properly)
-            valid_tokens = row[row != pad_id]
-            if len(valid_tokens) == 0 or int(valid_tokens[-1].item()) != sep_id:
-                penalty_applied[i] += no_sep_penalty
-            # Count bad tokens in the generated sequence
-            for tid in row.tolist():
-                if tid == pad_id:
-                    break
-                if tid in bad_token_ids:
-                    penalty_applied[i] += bad_token_penalty
-
-        rewards = rewards - penalty_applied
-
-        # ------------------------------------------------------------------
-        # Step 2c: Check if any sequence was detected by the HMM
-        # ------------------------------------------------------------------
-        # Use raw HMM scores (before penalties) to determine detection.
-        # rewards_np > 0 means the HMM matched the sequence.
-        hmm_detected = (rewards_np > 0).any()
-        frac_detected = float((rewards_np > 0).mean())
-
-        if not hmm_detected:
-            # No sequence matched the HMM — skip GRPO + KL entirely.
-            # Returning None tells Lightning to skip the backward pass and
-            # optimizer step for this batch (no gradient update).
-
-            # Log NaN for GRPO loss to make skipped steps visible.
-            # All on_step / on_epoch / prog_bar args MUST match the normal path
-            # exactly, otherwise Lightning raises MisconfigurationException.
-            self.log("train/hmm_grpo_loss", float("nan"),
-                     on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log("train/hmm_grpo_kl_loss", float("nan"),
-                     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-            self.log("train/hmm_grpo_total_loss", float("nan"),
-                     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-            self.log("train/hmm_grpo_mean_reward", rewards.mean().item(),
-                     on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log("train/hmm_grpo_max_reward", rewards.max().item(),
-                     on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            self.log("train/hmm_grpo_min_reward", rewards.min().item(),
-                     on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            self.log("train/hmm_grpo_frac_detected", frac_detected,
-                     on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log("train/hmm_grpo_mean_seq_length",
-                     float(np.mean([len(s) for s in generated_seqs])),
-                     on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            self.log("train/hmm_grpo_mean_penalty", penalty_applied.mean().item(),
-                     on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            self.log("train/hmm_grpo_frac_no_sep",
-                     float((penalty_applied >= no_sep_penalty).float().mean().item()),
-                     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        # Log dataset sample counts if available
+        if hasattr(self, 'log_train_dataset_sample_counts'):
             self.log_train_dataset_sample_counts(batch)
-            return None
-
-        # ------------------------------------------------------------------
-        # Step 3: Compute advantages
-        # ------------------------------------------------------------------
-        advantages = self._compute_grpo_advantages(rewards)
-
-        # ------------------------------------------------------------------
-        # Step 4: Build completion_ids for log-likelihood computation
-        # ------------------------------------------------------------------
-        # The prompt was encoded with add_final_sep=True (so the model sees
-        # ...seqN[SEP] and generates a fresh sequence).  _sample_seqs slices
-        # off the prompt, so generated_tokens starts with the first AA —
-        # it does NOT include the leading [SEP].
-        #
-        # _score_seqs_kv_cache expects:
-        #   • input_ids  WITHOUT a trailing [SEP]
-        #   • completion_ids that START with [SEP]
-        # (same convention used by the ProteinGym GRPO path).
-        #
-        # So we:
-        #   a) strip the trailing [SEP] from input_ids
-        #   b) prepend [SEP] to each generated completion
-        
-
-        # (a) Remove trailing SEP from context
-        assert int(input_ids[0, -1].item()) == sep_id, (
-            "Expected input_ids to end with SEP token for online GRPO; "
-            f"got token id {int(input_ids[0, -1].item())}"
-        )
-        input_ids_for_scoring = input_ids[:, :-1]  # (1, L_context - 1)
-
-        # (b) Prepend SEP to each generated sequence
-        gen_on_device = generated_tokens.to(self.device)  # (N, L_gen)
-        sep_prefix = torch.full(
-            (gen_on_device.shape[0], 1), sep_id,
-            dtype=gen_on_device.dtype, device=self.device,
-        )
-        completion_ids = torch.cat([sep_prefix, gen_on_device], dim=1)  # (N, 1+L_gen)
-        completion_ids = completion_ids.unsqueeze(0)  # (1, N, 1+L_gen)
-
-        # ------------------------------------------------------------------
-        # Step 5: Compute per-token log π_θ(yᵢ|x) under current policy
-        # ------------------------------------------------------------------
-        new_per_token_lps, new_per_token_mask = (
-            self._compute_per_token_log_probs_for_grpo(
-                input_ids=input_ids_for_scoring,
-                completion_ids=completion_ids,
-            )
-        )
-        # new_per_token_lps: (G, L_gen) — per-token log-probs under π_θ (with grads)
-        # new_per_token_mask: (G, L_gen) — validity mask from scoring path
-
-        # ------------------------------------------------------------------
-        # Step 6: Per-token PPO-style clipped GRPO loss
-        # ------------------------------------------------------------------
-        # old_per_token_lps: (G, L_gen) — per-token log-probs under π_old
-        # new_per_token_lps: (G, L_gen) — per-token log-probs under π_θ
-        # Ratios and clipping are computed per-token, then averaged.
-        old_lps = old_per_token_lps.to(self.device).detach()  # (G, T)
-        valid_mask = old_per_token_mask.to(self.device) & new_per_token_mask  # (G, T)
-
-        per_token_log_ratio = new_per_token_lps - old_lps  # (G, T)
-        per_token_ratio = torch.exp(per_token_log_ratio)    # (G, T)
-
-        eps = self.grpo_clip_ratio  # e.g. 0.2
-        clipped_ratio = torch.clamp(per_token_ratio, 1.0 - eps, 1.0 + eps)
-
-        # Advantages are per-sequence; broadcast to per-token
-        adv = advantages.unsqueeze(1)  # (G, 1)
-        surr1 = per_token_ratio * adv   # (G, T)
-        surr2 = clipped_ratio * adv     # (G, T)
-        per_token_obj = torch.min(surr1, surr2)  # (G, T)
-
-        # Average over valid tokens per sequence, then over sequences
-        num_valid = valid_mask.float().sum(dim=1).clamp(min=1)  # (G,)
-        per_seq_obj = (per_token_obj * valid_mask.float()).sum(dim=1) / num_valid
-        grpo_loss = -per_seq_obj.mean()
-
-        # Pre-compute per-sequence mean log-likelihoods for logging / correlation
-        with torch.no_grad():
-            mean_ll_per_seq = (
-                (new_per_token_lps.detach() * valid_mask.float()).sum(dim=1)
-                / num_valid
-            )  # (G,)
-
-        # Optional KL regularization to frozen reference model
-        # (separate from the clipping — this penalises drift from the *initial*
-        # pre-trained model, not from the generating policy of this step)
-        kl_loss = torch.tensor(0.0, device=grpo_loss.device)
-        if self.grpo_use_reference_model and self.grpo_beta > 0:
-            ref_model = self._get_reference_model()
-            if ref_model is not None:
-                kl_loss = self._compute_token_level_kl_divergence(
-                    ref_model=ref_model,
-                    input_ids=input_ids_for_scoring,
-                    completion_ids=completion_ids,
-                    group_indices=list(range(completion_ids.shape[1])),
-                )
-
-        total_loss = grpo_loss + self.grpo_beta * kl_loss
-
-        # ------------------------------------------------------------------
-        # Logging
-        # ------------------------------------------------------------------
-        self.log(
-            "train/hmm_grpo_loss",
-            grpo_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_kl_loss",
-            kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_total_loss",
-            total_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_mean_reward",
-            rewards.mean().item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_max_reward",
-            rewards.max().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_min_reward",
-            rewards.min().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_mean_advantage",
-            advantages.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_mean_log_likelihood",
-            mean_ll_per_seq.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        # Log per-token ratio diagnostics — useful for monitoring PPO health
-        with torch.no_grad():
-            ratio_detached = per_token_ratio.detach()
-            # Clip fraction: fraction of *valid tokens* that were clipped
-            ratio_valid = ratio_detached[valid_mask]
-            clipped_frac = (
-                (ratio_valid < 1.0 - eps) | (ratio_valid > 1.0 + eps)
-            ).float().mean().item() if ratio_valid.numel() > 0 else 0.0
-        self.log(
-            "train/hmm_grpo_mean_ratio",
-            ratio_valid.mean().item() if ratio_valid.numel() > 0 else 1.0,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_clip_fraction",
-            clipped_frac,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_group_size",
-            float(self.grpo_group_size),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_mean_seq_length",
-            float(np.mean([len(s) for s in generated_seqs])),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
-        # Log fraction of sequences that scored > 0 (detected by HMM)
-        self.log(
-            "train/hmm_grpo_frac_detected",
-            frac_detected,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        # Log penalty statistics
-        self.log(
-            "train/hmm_grpo_mean_penalty",
-            penalty_applied.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_frac_no_sep",
-            float((penalty_applied >= no_sep_penalty).float().mean().item()),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
-        # Correlation between per-sequence mean log-likelihoods and HMM rewards
-        ll_np = mean_ll_per_seq.cpu().float().numpy()
-        rew_np = rewards.detach().cpu().float().numpy()
-        if ll_np.std() > 1e-8 and rew_np.std() > 1e-8:
-            sp_corr, _ = spearmanr(ll_np, rew_np)
-            pe_corr, _ = pearsonr(ll_np, rew_np)
-        else:
-            sp_corr = 0.0
-            pe_corr = 0.0
-        self.log(
-            "train/hmm_grpo_ll_reward_spearman",
-            sp_corr,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/hmm_grpo_ll_reward_pearson",
-            pe_corr,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
-        self.log(
-            "train/hmm_family_id",
-            0.0,  # placeholder — family name logged separately
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
-        self.log_train_dataset_sample_counts(batch)
 
         return total_loss
 
@@ -1320,920 +872,6 @@ class BaseFamilyLitModule(LightningModule):
 
         return torch.cat(all_kl_divs, dim=0).mean()
 
-    # =========================================================================
-    # PETase GRPO Training (Online Reward Computation)
-    # =========================================================================
-
-    def petase_grpo_training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        """GRPO training step with ONLINE reward computation via ESMfold + energies.
-
-        Unlike grpo_training_step() which uses pre-computed DMS_scores,
-        this generates sequences, folds them, and computes energy rewards.
-
-        Args:
-            batch: Dictionary containing:
-                - input_ids: Prompt tokens (1, L_context) - could be seed seq or MSA context
-            batch_idx: Batch index
-
-        Returns:
-            loss: GRPO loss value
-        """
-        # Check required components are initialized
-        if not hasattr(self, "_petase_folder") or self._petase_folder is None:
-            raise RuntimeError(
-                "PETase folder not initialized. Call setup_petase_training() first."
-            )
-
-        prompt_ids = batch["input_ids"]  # (1, L_context)
-
-        # 1. Generate N candidate sequences
-        with torch.no_grad():
-            generated_ids, log_scores = self._sample_seqs(
-                prompt_ids,
-                num_samples=self.grpo_group_size,
-                max_tokens=self._petase_max_tokens,
-                max_generated_length=self._petase_max_length,
-                temperature=getattr(self, "_petase_temperature", 1.0),
-            )
-
-        # 2. Decode to amino acid sequences
-        sequences = []
-        for ids in generated_ids:
-            # Remove padding and special tokens
-            seq = self.tokenizer.decode(ids.tolist(), skip_special_tokens=True)
-            seq = seq.replace(" ", "").replace("-", "")
-            sequences.append(seq)
-
-        # 3. Filter out empty or too short sequences
-        valid_indices = []
-        valid_sequences = []
-        for i, seq in enumerate(sequences):
-            if len(seq) >= self._petase_min_length:
-                valid_indices.append(i)
-                valid_sequences.append(seq)
-
-        if len(valid_sequences) == 0:
-            # No valid sequences - return zero loss
-            log.warning("PETase GRPO: No valid sequences generated")
-            return torch.tensor(0.0, device=prompt_ids.device, requires_grad=True)
-
-        # 4. Fold structures (parallel across GPUs)
-        with torch.no_grad():
-            fold_results = self._petase_folder.fold_batch(
-                valid_sequences,
-                max_length=self._petase_max_length,
-            )
-
-        # 5. Compute energy-based rewards
-        rewards = self._compute_petase_energy_rewards(valid_sequences, fold_results)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
-
-        # 6. Compute GRPO advantages
-        advantages = self._compute_grpo_advantages(rewards)
-
-        # 7. Prepare completion_ids for log-likelihood computation
-        # Convert generated_ids to completion_ids format: (1, N, L)
-        # Only include valid sequences
-        valid_generated_ids = generated_ids[valid_indices]
-        completion_ids = valid_generated_ids.unsqueeze(0).to(prompt_ids.device)
-
-        # 8. Compute log-likelihoods with gradients
-        log_likelihoods = self._compute_variant_log_likelihoods_for_grpo(
-            input_ids=prompt_ids,
-            completion_ids=completion_ids,
-            group_indices=list(range(len(valid_sequences))),
-        )
-
-        # 9. GRPO loss
-        grpo_loss = -(advantages.to(log_likelihoods.device) * log_likelihoods).mean()
-
-        # 10. KL penalty
-        kl_loss = torch.tensor(0.0, device=grpo_loss.device)
-        if self.grpo_use_reference_model and self.grpo_beta > 0:
-            ref_model = self._get_reference_model()
-            if ref_model is not None:
-                kl_loss = self._compute_token_level_kl_divergence(
-                    ref_model=ref_model,
-                    input_ids=prompt_ids,
-                    completion_ids=completion_ids,
-                    group_indices=list(range(len(valid_sequences))),
-                )
-
-        total_loss = grpo_loss + self.grpo_beta * kl_loss
-
-        # Logging
-        self._log_petase_metrics(
-            grpo_loss, kl_loss, total_loss, advantages, log_likelihoods,
-            rewards, valid_sequences, fold_results
-        )
-
-        return total_loss
-
-    def setup_petase_training(
-        self,
-        template_pdb_path: str,
-        excluded_volume_pdb_path: str,
-        backbone_only_residues: Optional[List[int]] = None,
-        catalytic_residues: Optional[List[int]] = None,
-        min_length: int = 100,
-        max_length: int = 400,
-        max_tokens: int = 500,
-        temperature: float = 1.0,
-        num_fold_gpus: Optional[int] = None,
-        energy_weights: Optional[Dict[str, float]] = None,
-    ):
-        """Initialize PETase GRPO training components.
-
-        Args:
-            template_pdb_path: Path to PDB with important residues
-            excluded_volume_pdb_path: Path to PDB with substrate excluded volume
-            backbone_only_residues: Residue IDs to match only backbone N atoms (oxyanion hole)
-            catalytic_residues: Residue IDs for catalytic triad
-            min_length: Minimum sequence length
-            max_length: Maximum sequence length
-            max_tokens: Maximum tokens for generation
-            temperature: Sampling temperature
-            num_fold_gpus: Number of GPUs for ESMfold
-            energy_weights: Dict of energy term weights
-        """
-        from src.energies import (
-            ImportantResidueSet,
-            TemplateMatchEnergy,
-            ExcludedVolumeEnergy,
-            SizeEnergy,
-        )
-        from src.folding import MultiGPUESMFold
-
-        # Default backbone-only residues (oxyanion hole)
-        if backbone_only_residues is None:
-            backbone_only_residues = [87, 161]  # Y87, M161
-
-        # Default catalytic residues
-        if catalytic_residues is None:
-            catalytic_residues = [160, 237]  # S160, H237
-
-        # Default energy weights
-        default_weights = {
-            "template_match": 5.0,
-            "excluded_volume": 2.0,
-            "size": 0.5,
-            "plddt": 1.0,
-        }
-        if energy_weights is not None:
-            default_weights.update(energy_weights)
-        self._petase_energy_weights = default_weights
-
-        # Parse template
-        log.info(f"Loading PETase template from {template_pdb_path}")
-        self._petase_template = ImportantResidueSet.from_pdb(
-            template_pdb_path,
-            backbone_only_residues=backbone_only_residues,
-            catalytic_residues=catalytic_residues,
-        )
-
-        # Initialize energy terms
-        self._template_energy = TemplateMatchEnergy(
-            template=self._petase_template,
-            weight=default_weights["template_match"],
-        )
-
-        self._excluded_volume_energy = ExcludedVolumeEnergy.from_pdb(
-            excluded_volume_pdb_path,
-            weight=default_weights["excluded_volume"],
-        )
-
-        self._size_energy = SizeEnergy(
-            min_length=min_length,
-            weight=default_weights["size"],
-        )
-
-        # Initialize multi-GPU folder
-        log.info(f"Initializing MultiGPUESMFold with {num_fold_gpus} GPUs")
-        self._petase_folder = MultiGPUESMFold(num_gpus=num_fold_gpus)
-
-        # Store config
-        self._petase_min_length = min_length
-        self._petase_max_length = max_length
-        self._petase_max_tokens = max_tokens
-        self._petase_temperature = temperature
-
-        log.info("PETase GRPO training initialized")
-
-    def _compute_petase_energy_rewards(
-        self,
-        sequences: List[str],
-        fold_results: List,
-    ) -> List[float]:
-        """Compute energy-based rewards for PETase sequences.
-
-        Reward = -(template_rmsd + excluded_vol + size_penalty) + plddt_bonus
-
-        Args:
-            sequences: List of amino acid sequences
-            fold_results: List of FoldingResult from ESMfold
-
-        Returns:
-            List of reward values (higher is better)
-        """
-        rewards = []
-
-        for seq, fold_result in zip(sequences, fold_results):
-            # Skip if folding failed
-            if fold_result.mean_plddt < 1.0:
-                rewards.append(-100.0)
-                continue
-
-            # Get structure data from folding result
-            coords = fold_result.coords  # (L, 37, 3)
-            plddt = fold_result.plddt
-
-            # Extract atom information for energy calculation
-            # Use CA coordinates for simplicity in template matching
-            ca_coords = fold_result.get_ca_coords()
-
-            # Build residue info lists
-            L = len(seq)
-            res_ids = list(range(1, L + 1))
-            res_names = [_aa_to_three_letter(aa) for aa in seq]
-            atom_names = ["CA"] * L
-            elements = ["C"] * L
-
-            # 1. Template match energy (use CA for sliding window match)
-            template_value, template_weighted, _ = self._template_energy.compute(
-                structure_coords=ca_coords,
-                structure_res_ids=res_ids,
-                structure_res_names=res_names,
-                structure_atom_names=atom_names,
-            )
-
-            # 2. Excluded volume energy
-            excluded_value, excluded_weighted, _ = self._excluded_volume_energy.compute(
-                structure_coords=ca_coords,
-                structure_elements=elements,
-            )
-
-            # 3. Size energy
-            size_value, size_weighted, _ = self._size_energy.compute(len(seq))
-
-            # 4. pLDDT bonus (higher is better)
-            plddt_bonus = (fold_result.mean_plddt / 100.0) * self._petase_energy_weights["plddt"]
-
-            # Combine into reward (negative energies, positive pLDDT)
-            reward = -(template_weighted + excluded_weighted + size_weighted) + plddt_bonus
-            rewards.append(reward)
-
-        return rewards
-
-    def _log_petase_metrics(
-        self,
-        grpo_loss: torch.Tensor,
-        kl_loss: torch.Tensor,
-        total_loss: torch.Tensor,
-        advantages: torch.Tensor,
-        log_likelihoods: torch.Tensor,
-        rewards: torch.Tensor,
-        sequences: List[str],
-        fold_results: List,
-    ):
-        """Log PETase GRPO training metrics."""
-        self.log(
-            "train/petase_grpo_loss",
-            grpo_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_kl_loss",
-            kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_total_loss",
-            total_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_mean_reward",
-            rewards.mean().item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_mean_advantage",
-            advantages.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_mean_log_likelihood",
-            log_likelihoods.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_mean_seq_length",
-            float(np.mean([len(s) for s in sequences])),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_mean_plddt",
-            float(np.mean([f.mean_plddt for f in fold_results])),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/petase_group_size",
-            float(len(sequences)),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
-    # =========================================================================
-    # Mipa GRPO Training (TM-score Reward Computation)
-    # =========================================================================
-
-    def setup_mipa_training(
-        self,
-        target_pdb_path: str,
-        reasoning_mode: bool = False,
-        num_reasoning_seqs: int = 3,
-        max_length: int = 400,
-        max_tokens: int = 600,
-        temperature: float = 1.0,
-        num_fold_gpus: Optional[int] = None,
-        use_rank_local_folding: bool = True,
-        plddt_weight: float = 0.1,
-        length_penalty_threshold: int = 1048,
-        tmalign_binary: str = "TMalign",
-        batch_generation: bool = True,
-        generation_batch_size: int = 8,
-        evolving_prompt_enabled: bool = False,
-        evolving_prompt_update_interval: int = 250,
-        evolving_prompt_min_tm_score: float = 0.3,
-    ):
-        """Initialize Mipa GRPO training components.
-
-        Args:
-            target_pdb_path: Path to the target PDB structure (mipa_8YTU.pdb)
-            reasoning_mode: Whether to use reasoning chain generation
-            num_reasoning_seqs: Number of intermediate reasoning sequences (default: 3)
-            max_length: Maximum sequence length
-            max_tokens: Maximum tokens for generation
-            temperature: Sampling temperature
-            num_fold_gpus: Number of GPUs for ESMfold (ignored if use_rank_local_folding=True)
-            use_rank_local_folding: If True, each DDP rank uses only its own GPU for folding
-                to avoid deadlocks. This is the recommended setting for multi-GPU training.
-            plddt_weight: Weight for pLDDT bonus in reward
-            length_penalty_threshold: Sequences longer than this get penalized
-            tmalign_binary: Path or name of TMalign binary
-            batch_generation: If True, use batched model.generate() calls for speedup
-            generation_batch_size: Number of sequences to generate in parallel per batch
-            evolving_prompt_enabled: If True, update prompt to high-reward sequences periodically
-            evolving_prompt_update_interval: Steps between prompt updates (default: 250)
-            evolving_prompt_min_tm_score: Minimum TM-score to be a candidate (default: 0.3)
-        """
-        from src.structure import TMAlignScorer
-
-        log.info(f"Initializing Mipa GRPO training with target: {target_pdb_path}")
-
-        # Initialize TM-score calculator
-        self._mipa_tm_scorer = TMAlignScorer(
-            reference_pdb_path=target_pdb_path,
-            tmalign_binary=tmalign_binary,
-        )
-        log.info(f"TMAlignScorer initialized, reference length: {self._mipa_tm_scorer.reference_length}")
-
-        # Store folding config - folder will be initialized lazily on first use
-        # This is necessary because trainer.local_rank isn't available until training starts
-        self._mipa_folder = None  # Will be initialized in _ensure_mipa_folder_initialized()
-        self._mipa_num_fold_gpus = num_fold_gpus
-        self._mipa_use_rank_local_folding = use_rank_local_folding
-
-        # Store configuration
-        self._mipa_reasoning_mode = reasoning_mode
-        self._mipa_num_reasoning_seqs = num_reasoning_seqs
-        self._mipa_max_length = max_length
-        self._mipa_max_tokens = max_tokens
-        self._mipa_temperature = temperature
-        self._mipa_plddt_weight = plddt_weight
-        self._mipa_length_penalty_threshold = length_penalty_threshold
-        self._mipa_batch_generation = batch_generation
-        self._mipa_generation_batch_size = generation_batch_size
-
-        # Evolving prompt configuration
-        self._evolving_prompt_enabled = evolving_prompt_enabled
-        self._evolving_prompt_update_interval = evolving_prompt_update_interval
-        self._evolving_prompt_min_tm_score = evolving_prompt_min_tm_score
-        self._evolving_prompt_current_sequence = None
-        self._evolving_prompt_current_tokens = None
-        self._evolving_prompt_current_reward = None
-        self._evolving_prompt_candidate_buffer = []
-
-        log.info(f"Mipa GRPO training initialized (reasoning_mode={reasoning_mode}, batch_generation={batch_generation})")
-        if evolving_prompt_enabled:
-            log.info(f"Evolving prompts enabled: update every {evolving_prompt_update_interval} steps, min TM-score={evolving_prompt_min_tm_score}")
-
-    def _ensure_mipa_folder_initialized(self):
-        """Lazily initialize the ESMfold folder on first use.
-
-        This is called during the first training step when trainer.local_rank is available.
-        """
-        if self._mipa_folder is not None:
-            return
-
-        from src.folding import MultiGPUESMFold
-
-        # Determine GPU IDs for folding
-        # In DDP training, each rank should only use its own GPU to avoid deadlocks
-        fold_gpu_ids = None
-        if self._mipa_use_rank_local_folding and hasattr(self, 'trainer') and self.trainer is not None:
-            local_rank = getattr(self.trainer, 'local_rank', 0)
-            fold_gpu_ids = [local_rank]
-            log.info(f"Rank-local folding enabled: using GPU {local_rank} for folding")
-        elif self._mipa_num_fold_gpus is not None:
-            fold_gpu_ids = list(range(self._mipa_num_fold_gpus))
-            log.info(f"Using GPUs {fold_gpu_ids} for folding")
-
-        # Initialize multi-GPU folder
-        log.info(f"Initializing MultiGPUESMFold with gpu_ids={fold_gpu_ids}")
-        self._mipa_folder = MultiGPUESMFold(gpu_ids=fold_gpu_ids)
-
-    def mipa_grpo_training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        """GRPO training step with TM-score rewards for Mipa structure matching.
-
-        Two modes:
-        - Direct: Generate 1 sequence, score with TM-score
-        - Reasoning: Generate continuously until 4 [SEP] tokens, score final only
-
-        Args:
-            batch: Dictionary containing:
-                - input_ids: Prompt tokens (1, L_context)
-            batch_idx: Batch index
-
-        Returns:
-            loss: GRPO loss value
-        """
-        # Check required components are initialized
-        if self._mipa_tm_scorer is None:
-            raise RuntimeError(
-                "Mipa training not initialized. Call setup_mipa_training() first."
-            )
-
-        # Lazily initialize folder on first use (when trainer.local_rank is available)
-        self._ensure_mipa_folder_initialized()
-
-        # Use evolved prompt if available, otherwise use batch prompt
-        if self._evolving_prompt_enabled and self._evolving_prompt_current_tokens is not None:
-            prompt_ids = self._evolving_prompt_current_tokens.to(batch["input_ids"].device)
-        else:
-            prompt_ids = batch["input_ids"]  # (1, L_context)
-
-        # Set per-rank seed for generation diversity in DDP
-        # Without this, all ranks generate identical sequences due to global seed
-        # Use global_step + batch_idx to ensure unique seeds across all steps:
-        # - global_step ensures different seeds after each optimizer update
-        # - batch_idx handles accumulate_grad_batches > 1 (multiple batches per step)
-        # - rank ensures different GPUs generate different sequences
-        if hasattr(self, "trainer") and self.trainer is not None:
-            rank = self.trainer.global_rank
-            global_step = self.trainer.global_step
-            generation_seed = hash((42, rank, global_step, batch_idx)) % (2**32)
-            torch.manual_seed(generation_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(generation_seed)
-
-        # 1. Generate sequences
-        with torch.no_grad():
-            if self._mipa_reasoning_mode:
-                (
-                    full_tokens,
-                    final_tokens,
-                    gen_scores,
-                    old_lps,
-                    old_mask,
-                    incomplete_mask,
-                ) = self._sample_seqs_reasoning(
-                    prompt_ids,
-                    num_samples=self.grpo_group_size,
-                    max_tokens=self._mipa_max_tokens,
-                    num_reasoning_seqs=self._mipa_num_reasoning_seqs,
-                    max_generated_length=self._mipa_max_length,
-                    temperature=self._mipa_temperature,
-                    return_per_token_log_probs=True,
-                )
-            else:
-                (
-                    final_tokens,
-                    gen_scores,
-                    old_lps,
-                    old_mask,
-                ) = self._sample_seqs(
-                    prompt_ids,
-                    num_samples=self.grpo_group_size,
-                    max_tokens=self._mipa_max_tokens,
-                    max_generated_length=self._mipa_max_length,
-                    temperature=self._mipa_temperature,
-                    return_per_token_log_probs=True,
-                    batch_generation=self._mipa_batch_generation,
-                    generation_batch_size=self._mipa_generation_batch_size,
-                )
-                incomplete_mask = torch.zeros(self.grpo_group_size, dtype=torch.bool)
-
-        # 2. Decode final sequences
-        sequences = []
-        for ids in final_tokens:
-            seq = self.tokenizer.decode(ids.tolist(), skip_special_tokens=True)
-            seq = seq.replace(" ", "").replace("-", "")
-            sequences.append(seq)
-
-        # Store sequences for SequenceDiversityCallback (debug/testing)
-        self._debug_generated_sequences = sequences.copy()
-        self._debug_generated_tokens = final_tokens.clone()
-
-        # Log first two generated sequences on rank 0 only (no sync to avoid hangs)
-        rank = self.trainer.global_rank if self.trainer is not None else 0
-        if rank == 0:
-            log.info(
-                f"Generated {len(sequences)} sequences. First two:\n"
-                f"  [0] ({len(sequences[0])}aa): {sequences[0]}\n"
-                f"  [1] ({len(sequences[1])}aa): {sequences[1]}"
-            )
-
-        # Debug: Print progress for all ranks
-        import sys
-        print(f"[DEBUG rank={rank}] After generation, {len(sequences)} seqs, lengths: {[len(s) for s in sequences]}", flush=True)
-        sys.stdout.flush()
-
-        # 3. Compute penalties
-        penalties = self._compute_mipa_penalties(
-            final_tokens, sequences, incomplete_mask
-        )
-
-        # 4. Fold valid sequences with ESMfold
-        valid_mask = penalties < 50  # Not too heavily penalized
-        valid_indices = [i for i, v in enumerate(valid_mask.tolist()) if v]
-        valid_sequences = [sequences[i] for i in valid_indices]
-
-        # Initialize rewards and alignment metrics
-        rewards = torch.zeros(len(sequences), device=prompt_ids.device)
-        tm_scores = [0.0] * len(sequences)
-        plddts = [0.0] * len(sequences)
-        rmsds = [0.0] * len(sequences)
-        aligned_lengths = [0] * len(sequences)
-        seq_identities = [0.0] * len(sequences)
-
-        if len(valid_sequences) > 0:
-            # Fold structures
-            print(f"[DEBUG rank={rank}] Starting fold_batch for {len(valid_sequences)} seqs", flush=True)
-            with torch.no_grad():
-                fold_results = self._mipa_folder.fold_batch(
-                    valid_sequences,
-                    max_length=self._mipa_max_length,
-                )
-            print(f"[DEBUG rank={rank}] Finished fold_batch", flush=True)
-
-            # 5. Compute alignments (parallel TMalign calls)
-            print(f"[DEBUG rank={rank}] Starting TMalign", flush=True)
-            alignment_results = self._mipa_tm_scorer.align_batch(fold_results)
-            print(f"[DEBUG rank={rank}] Finished TMalign", flush=True)
-
-            # 6. Compute rewards: TM-score + scaled pLDDT - penalties
-            for j, (idx, fr, align_result) in enumerate(zip(valid_indices, fold_results, alignment_results)):
-                plddt_bonus = (fr.mean_plddt / 100.0) * self._mipa_plddt_weight
-                rewards[idx] = align_result.tm_score + plddt_bonus - penalties[idx]
-                tm_scores[idx] = align_result.tm_score
-                plddts[idx] = fr.mean_plddt
-                rmsds[idx] = align_result.rmsd
-                aligned_lengths[idx] = align_result.aligned_length
-                seq_identities[idx] = align_result.seq_identity
-        else:
-            fold_results = []
-
-        # Apply penalties to invalid sequences
-        for i in range(len(sequences)):
-            if i not in valid_indices:
-                rewards[i] = -penalties[i]
-
-        # 7. Compute advantages
-        advantages = self._compute_grpo_advantages(rewards)
-
-        # 8. Compute per-token log-probs under current policy (with gradients)
-        # Build completion_ids for scoring
-        if self._mipa_reasoning_mode:
-            # For reasoning mode, score the full chain (all tokens)
-            completion_ids = full_tokens.unsqueeze(0).to(prompt_ids.device)
-        else:
-            completion_ids = final_tokens.unsqueeze(0).to(prompt_ids.device)
-
-        # Compute log-likelihoods with gradients
-        print(f"[DEBUG rank={rank}] Starting log_likelihoods computation", flush=True)
-        log_likelihoods = self._compute_variant_log_likelihoods_for_grpo(
-            input_ids=prompt_ids,
-            completion_ids=completion_ids,
-            group_indices=list(range(len(sequences))),
-        )
-        print(f"[DEBUG rank={rank}] Finished log_likelihoods computation", flush=True)
-
-        # 9. GRPO loss
-        grpo_loss = -(advantages.to(log_likelihoods.device) * log_likelihoods).mean()
-
-        # 10. KL penalty
-        kl_loss = torch.tensor(0.0, device=grpo_loss.device)
-        if self.grpo_use_reference_model and self.grpo_beta > 0:
-            print(f"[DEBUG rank={rank}] Starting KL divergence computation", flush=True)
-            ref_model = self._get_reference_model()
-            if ref_model is not None:
-                kl_loss = self._compute_token_level_kl_divergence(
-                    ref_model=ref_model,
-                    input_ids=prompt_ids,
-                    completion_ids=completion_ids,
-                    group_indices=list(range(len(sequences))),
-                )
-            print(f"[DEBUG rank={rank}] Finished KL divergence computation", flush=True)
-
-        total_loss = grpo_loss + self.grpo_beta * kl_loss
-
-        # 11. Synchronize all ranks before logging to avoid sync_dist hangs
-        # This is needed because folding times vary across sequences, causing ranks
-        # to reach the logging call at different times
-        print(f"[DEBUG rank={rank}] Before barrier", flush=True)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        print(f"[DEBUG rank={rank}] After barrier", flush=True)
-
-        # 12. Logging
-        self._log_mipa_metrics(
-            grpo_loss=grpo_loss,
-            kl_loss=kl_loss,
-            total_loss=total_loss,
-            advantages=advantages,
-            log_likelihoods=log_likelihoods,
-            rewards=rewards,
-            tm_scores=tm_scores,
-            plddts=plddts,
-            rmsds=rmsds,
-            aligned_lengths=aligned_lengths,
-            seq_identities=seq_identities,
-            sequences=sequences,
-            incomplete_mask=incomplete_mask,
-        )
-
-        # 13. Collect candidates for evolving prompt (sequences with good TM-scores)
-        if self._evolving_prompt_enabled:
-            for i, (seq, tm, rew) in enumerate(zip(sequences, tm_scores, rewards.tolist())):
-                if tm >= self._evolving_prompt_min_tm_score:
-                    self._evolving_prompt_candidate_buffer.append({
-                        'sequence': seq,
-                        'reward': rew,
-                        'tm_score': tm,
-                    })
-            # Keep top 1000 candidates by highest reward (not most recent)
-            if len(self._evolving_prompt_candidate_buffer) > 1000:
-                self._evolving_prompt_candidate_buffer = sorted(
-                    self._evolving_prompt_candidate_buffer,
-                    key=lambda x: x['reward'],
-                    reverse=True
-                )[:1000]
-
-        return total_loss
-
-    def _compute_mipa_penalties(
-        self,
-        tokens: torch.Tensor,
-        sequences: List[str],
-        incomplete_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute penalties for invalid sequences.
-
-        Args:
-            tokens: Generated tokens (N, L)
-            sequences: Decoded amino acid sequences
-            incomplete_mask: Boolean mask indicating sequences that didn't complete (reasoning mode)
-
-        Returns:
-            Tensor of penalties (N,)
-        """
-        sep_id = self.tokenizer.sep_token_id
-        pad_id = self.tokenizer.pad_token_id
-
-        no_sep_penalty = 20.0
-        length_penalty = 10.0
-        bad_token_penalty = 5.0
-        incomplete_penalty = 15.0  # Didn't generate enough SEPs in reasoning mode
-
-        penalties = torch.zeros(len(sequences), device=tokens.device)
-
-        for i, (row, seq) in enumerate(zip(tokens, sequences)):
-            # Check for missing final [SEP]
-            valid_tokens = row[row != pad_id]
-            if len(valid_tokens) == 0 or int(valid_tokens[-1].item()) != sep_id:
-                penalties[i] += no_sep_penalty
-
-            # Check length > threshold
-            if len(seq) > self._mipa_length_penalty_threshold:
-                penalties[i] += length_penalty
-
-            # Count bad tokens
-            good_chars = set("ACDEFGHIKLMNPQRSTVWY") # todo this will not punsh multi-token special chars correctly
-            bad_count = sum(1 for c in seq if c not in good_chars)
-            penalties[i] += bad_count * bad_token_penalty
-
-            # Penalty for incomplete reasoning chains
-            if incomplete_mask[i]:
-                penalties[i] += incomplete_penalty
-
-        return penalties
-
-    def _log_mipa_metrics(
-        self,
-        grpo_loss: torch.Tensor,
-        kl_loss: torch.Tensor,
-        total_loss: torch.Tensor,
-        advantages: torch.Tensor,
-        log_likelihoods: torch.Tensor,
-        rewards: torch.Tensor,
-        tm_scores: List[float],
-        plddts: List[float],
-        rmsds: List[float],
-        aligned_lengths: List[int],
-        seq_identities: List[float],
-        sequences: List[str],
-        incomplete_mask: torch.Tensor,
-    ):
-        """Log Mipa GRPO training metrics."""
-        self.log(
-            "train/mipa_grpo_loss",
-            grpo_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_kl_loss",
-            kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_total_loss",
-            total_loss.item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_reward",
-            rewards.mean().item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_min_reward",
-            rewards.min().item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_max_reward",
-            rewards.max().item(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_tm_score",
-            float(np.mean([t for t in tm_scores if t > 0]) if any(t > 0 for t in tm_scores) else 0.0),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_min_tm_score",
-            float(min(tm_scores)) if tm_scores else 0.0,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_max_tm_score",
-            float(max(tm_scores)) if tm_scores else 0.0,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_plddt",
-            float(np.mean([p for p in plddts if p > 0]) if any(p > 0 for p in plddts) else 0.0),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-        )
-        # TMalign alignment metrics
-        self.log(
-            "train/mipa_mean_rmsd",
-            float(np.mean([r for r in rmsds if r > 0]) if any(r > 0 for r in rmsds) else 0.0),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_aligned_length",
-            float(np.mean([a for a in aligned_lengths if a > 0]) if any(a > 0 for a in aligned_lengths) else 0.0),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_seq_identity",
-            float(np.mean([s for s in seq_identities if s > 0]) if any(s > 0 for s in seq_identities) else 0.0),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_advantage",
-            advantages.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_log_likelihood",
-            log_likelihoods.mean().item(),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_mean_seq_length",
-            float(np.mean([len(s) for s in sequences])),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        # Fraction of sequences that completed (for reasoning mode)
-        frac_complete = 1.0 - incomplete_mask.float().mean().item()
-        self.log(
-            "train/mipa_frac_complete",
-            frac_complete,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=False,
-            sync_dist=True,
-        )
-        self.log(
-            "train/mipa_group_size",
-            float(len(sequences)),
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            sync_dist=True,
-        )
-
     def log_train_dataset_sample_counts(self, batch: Dict[str, Any]) -> None:
         """Keep and log a running count of *samples* seen per dataset name during training.
 
@@ -2339,18 +977,7 @@ class BaseFamilyLitModule(LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         """Save additional model state to checkpoint."""
-        # Save evolving prompt state if enabled
-        if self._evolving_prompt_enabled and self._evolving_prompt_current_sequence is not None:
-            checkpoint['evolving_prompt'] = {
-                'current_sequence': self._evolving_prompt_current_sequence,
-                'current_reward': self._evolving_prompt_current_reward,
-                'candidate_buffer': self._evolving_prompt_candidate_buffer,
-            }
-            log.info(
-                f"Saving evolving prompt state: {len(self._evolving_prompt_current_sequence)}aa sequence, "
-                f"reward={self._evolving_prompt_current_reward}, "
-                f"{len(self._evolving_prompt_candidate_buffer)} candidates in buffer"
-            )
+        pass
 
     def on_load_checkpoint(self, checkpoint):
         """Handle checkpoint loading, optionally overriding optimizer and scheduler states.
@@ -2414,36 +1041,6 @@ class BaseFamilyLitModule(LightningModule):
             if "loops" in checkpoint:
                 log.info("Resetting training loop states")
                 del checkpoint["loops"]
-
-        # Restore evolving prompt state if present
-        if 'evolving_prompt' in checkpoint:
-            from src.data.objects import ProteinDocument
-
-            evolving_state = checkpoint['evolving_prompt']
-            self._evolving_prompt_current_sequence = evolving_state.get('current_sequence')
-            self._evolving_prompt_current_reward = evolving_state.get('current_reward')
-            self._evolving_prompt_candidate_buffer = evolving_state.get('candidate_buffer', [])
-            # Re-tokenize the sequence (tokens need to be created at runtime)
-            if self._evolving_prompt_current_sequence is not None:
-                # Create a ProteinDocument (tokenizer.encode expects this)
-                proteins = ProteinDocument(
-                    sequences=[self._evolving_prompt_current_sequence],
-                    identifier="evolved_prompt",
-                )
-                tokenized = self.tokenizer.encode(
-                    proteins,
-                    document_token="[RAW]",
-                    add_final_sep=True,
-                )
-                self._evolving_prompt_current_tokens = torch.tensor(
-                    tokenized.input_ids
-                ).unsqueeze(0)
-                log.info(
-                    f"Restored evolving prompt: {len(self._evolving_prompt_current_sequence)}aa sequence, "
-                    f"reward={self._evolving_prompt_current_reward}, "
-                    f"{len(self._evolving_prompt_current_tokens[0])} tokens, "
-                    f"{len(self._evolving_prompt_candidate_buffer)} candidates in buffer"
-                )
 
     def configure_optimizers(self) -> Dict[str, Any]:
         optimizer_name = self.hparams.get("optimizer", "adamw")
@@ -3162,7 +1759,6 @@ class BaseFamilyLitModule(LightningModule):
         all_per_token_lps: List[List[float]] = []
 
         # Generate all sequences in batches without retry loop
-        # Invalid sequences (no SEP, repetitive, too long) will be penalized by _compute_mipa_penalties
         generated_count = 0
 
         with tqdm.tqdm(total=num_samples, desc="Generating sequences (batched)") as pbar:
@@ -3276,180 +1872,6 @@ class BaseFamilyLitModule(LightningModule):
 
         return padded_outputs, all_scores
 
-    def _sample_seqs_reasoning(
-        self,
-        input_ids: torch.Tensor,
-        num_samples: int,
-        max_tokens: int,
-        num_reasoning_seqs: int = 3,
-        max_generated_length: Optional[int] = None,
-        temperature: float = 1.0,
-        return_per_token_log_probs: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[float], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Generate sequences with reasoning chain (continuous generation).
-
-        Generates tokens continuously until (num_reasoning_seqs + 1) [SEP] tokens
-        are seen, then extracts the final sequence (after the last reasoning [SEP]).
-
-        Args:
-            input_ids: Prompt tokens (1, L_prompt)
-            num_samples: Number of samples to generate
-            max_tokens: Maximum total tokens to generate
-            num_reasoning_seqs: Number of intermediate reasoning sequences (default: 3)
-            max_generated_length: Maximum length per sequence segment
-            temperature: Sampling temperature
-            return_per_token_log_probs: Whether to return per-token log probs
-
-        Returns:
-            full_tokens: All generated tokens (N, L_full)
-            final_tokens: Only final sequence tokens (N, L_final)
-            final_scores: Mean log-probs for full sequence
-            per_token_lps: Per-token log probs tensor (if return_per_token_log_probs)
-            per_token_mask: Validity mask tensor (if return_per_token_log_probs)
-            incomplete_mask: Boolean mask indicating sequences that didn't complete
-        """
-        from transformers import StoppingCriteria
-
-        sep_token_id = self.tokenizer.sep_token_id
-        pad_token_id = self.tokenizer.pad_token_id
-        required_seps = num_reasoning_seqs + 1  # e.g., 4 for default
-
-        # Custom stopping criteria that counts SEP tokens
-        class SEPCountCriteria(StoppingCriteria):
-            def __init__(self, target_count, sep_id, prompt_length):
-                self.target_count = target_count
-                self.sep_id = sep_id
-                self.prompt_length = prompt_length
-
-            def __call__(self, gen_input_ids, scores, **kwargs):
-                # Check generated portion only
-                generated = gen_input_ids[:, self.prompt_length:]
-                sep_counts = (generated == self.sep_id).sum(dim=1)
-                return (sep_counts >= self.target_count).all()
-
-        assert (
-            input_ids.shape[0] == 1 and input_ids.ndim == 2
-        ), "Only batch size 1 is supported for sampling; batch dim must be present"
-
-        prompt_len = input_ids.shape[1]
-
-        all_full_outputs: List[torch.Tensor] = []
-        all_final_outputs: List[torch.Tensor] = []
-        all_scores: List[float] = []
-        all_per_token_lps: List[List[float]] = []
-        all_incomplete: List[bool] = []
-
-        # Generate one sample at a time
-        for _ in tqdm.tqdm(range(num_samples), "Generating reasoning chains"):
-            # Set up stopping criteria
-            stopping = StoppingCriteriaList([
-                SEPCountCriteria(required_seps, sep_token_id, prompt_len)
-            ])
-
-            # Generate with SEP count stopping
-            gen_out = self.model.generate(
-                input_ids=input_ids,
-                num_return_sequences=1,
-                return_dict_in_generate=True,
-                output_scores=True,
-                do_sample=True,
-                temperature=temperature,
-                max_new_tokens=max_tokens,
-                pad_token_id=pad_token_id,
-                stopping_criteria=stopping,
-            )
-
-            seqs_full = gen_out.sequences  # (1, L_total)
-            scores_list = gen_out.scores  # List[T] of (1, V)
-
-            # Get generated portion
-            full_generated = seqs_full[0, prompt_len:]
-
-            # Count SEPs and extract final sequence
-            sep_positions = (full_generated == sep_token_id).nonzero(as_tuple=True)[0]
-            n_seps = len(sep_positions)
-
-            incomplete = n_seps < required_seps
-            all_incomplete.append(incomplete)
-
-            # Extract final sequence: tokens after the (num_reasoning_seqs)th SEP
-            # up to (and including) the final SEP
-            if n_seps >= num_reasoning_seqs:
-                # Start after the last "reasoning" SEP
-                start_idx = int(sep_positions[num_reasoning_seqs - 1].item()) + 1
-                # Include up to the final SEP or end
-                if n_seps >= required_seps:
-                    end_idx = int(sep_positions[required_seps - 1].item()) + 1
-                else:
-                    end_idx = len(full_generated)
-                final_seq = full_generated[start_idx:end_idx]
-            else:
-                # Not enough SEPs - use whatever we have after the last SEP (or all)
-                if n_seps > 0:
-                    start_idx = int(sep_positions[-1].item()) + 1
-                    final_seq = full_generated[start_idx:]
-                else:
-                    final_seq = full_generated
-
-            all_full_outputs.append(full_generated.unsqueeze(0))
-            all_final_outputs.append(final_seq.unsqueeze(0))
-
-            # Compute mean log-prob for the full generated sequence
-            total_logp = 0.0
-            count = 0
-            token_lps: List[float] = []
-            T = len(scores_list)
-            for t in range(T):
-                if t < full_generated.shape[0]:
-                    token_id = int(full_generated[t].item())
-                    lp = F.log_softmax(scores_list[t], dim=-1)[0, token_id].item()
-                    total_logp += float(lp)
-                    token_lps.append(float(lp))
-                    count += 1
-
-            all_scores.append(total_logp / max(count, 1))
-            all_per_token_lps.append(token_lps)
-
-        # Pad and stack full outputs
-        max_full_length = max([o.shape[1] for o in all_full_outputs])
-        padded_full = torch.full(
-            (num_samples, max_full_length), pad_token_id, dtype=torch.long
-        )
-        for i, o in enumerate(all_full_outputs):
-            padded_full[i, : o.shape[1]] = o[0]
-
-        # Pad and stack final outputs
-        max_final_length = max([o.shape[1] for o in all_final_outputs])
-        padded_final = torch.full(
-            (num_samples, max_final_length), pad_token_id, dtype=torch.long
-        )
-        for i, o in enumerate(all_final_outputs):
-            padded_final[i, : o.shape[1]] = o[0]
-
-        incomplete_mask = torch.tensor(all_incomplete, dtype=torch.bool)
-
-        if return_per_token_log_probs:
-            per_token_lps_tensor = torch.zeros(num_samples, max_full_length)
-            per_token_mask_tensor = torch.zeros(
-                num_samples, max_full_length, dtype=torch.bool
-            )
-            for idx, lps in enumerate(all_per_token_lps):
-                n_tok = len(lps)
-                per_token_lps_tensor[idx, :n_tok] = torch.tensor(lps)
-                per_token_mask_tensor[idx, :n_tok] = True
-            return (
-                padded_full,
-                padded_final,
-                all_scores,
-                per_token_lps_tensor,
-                per_token_mask_tensor,
-                incomplete_mask,
-            )
-
-        return padded_full, padded_final, all_scores, incomplete_mask
-
-    @torch.no_grad()
     def log_metrics(self, batch, outputs, step_name, log_global: bool = True):
         # N.B. actually val logging is a bit different because of this ds name thing
         loss = outputs.loss
