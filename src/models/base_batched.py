@@ -1,7 +1,6 @@
 import copy
 import math
 import os
-import random
 import time
 import warnings
 from collections import defaultdict
@@ -99,7 +98,6 @@ class BaseFamilyLitModule(LightningModule):
         # GRPO (Group Relative Policy Optimization) hyperparameters
         grpo_enabled: bool = False,
         grpo_beta: float = 0.05,  # KL penalty coefficient
-        grpo_group_size: int = 16,  # Number of sequences to compare per training step
         grpo_clip_ratio: float = 0.2,  # PPO-style clipping
         grpo_normalize_rewards: bool = True,  # Normalize DMS scores within group
         grpo_use_reference_model: bool = False,  # Use KL regularization to initial model
@@ -130,7 +128,6 @@ class BaseFamilyLitModule(LightningModule):
         # GRPO configuration
         self.grpo_enabled = grpo_enabled
         self.grpo_beta = grpo_beta
-        self.grpo_group_size = grpo_group_size
         self.grpo_clip_ratio = grpo_clip_ratio
         self.grpo_normalize_rewards = grpo_normalize_rewards
         self.grpo_use_reference_model = grpo_use_reference_model
@@ -141,6 +138,11 @@ class BaseFamilyLitModule(LightningModule):
 
         # Reference model for KL regularization (initialized lazily if needed)
         self._reference_model = None
+
+        # Frozen encoder model for GRPO: computes prompt KV cache without
+        # gradients so that only the decoder (self.model) is updated by GRPO.
+        # Set via ``init_encoder_decoder_grpo()`` from the pipeline.
+        self._encoder_model = None
 
     def train(self, mode: bool = True):
         """Ensure the frozen GRPO reference model never leaves eval mode.
@@ -153,6 +155,8 @@ class BaseFamilyLitModule(LightningModule):
         super().train(mode)
         if self._reference_model is not None:
             self._reference_model.eval()
+        if self._encoder_model is not None:
+            self._encoder_model.eval()
         return self
 
     def forward(
@@ -273,7 +277,7 @@ class BaseFamilyLitModule(LightningModule):
 
         # Check if this is a GRPO batch (contains rewards or DMS_scores)
         if ("rewards" in batch or "DMS_scores" in batch) and self.grpo_enabled:
-            return self.grpo_training_step(batch, batch_idx)
+            return self._grpo_step_from_batch(batch)
 
         outputs = self(
             input_ids=batch["input_ids"],
@@ -320,6 +324,22 @@ class BaseFamilyLitModule(LightningModule):
             # Keep reference deterministic (no dropout) and frozen.
             self._reference_model.eval()
         return self._reference_model
+
+    def init_encoder_decoder_grpo(self) -> None:
+        """Initialise the frozen encoder model for encoder-decoder GRPO.
+
+        Creates a frozen copy of ``self.model`` that will be used to compute
+        the prompt KV cache during GRPO steps.  The trainable ``self.model``
+        (decoder) then processes only the generated completions, so gradients
+        do not flow through the prompt embeddings.
+        """
+        if self._encoder_model is not None:
+            return  # already initialised
+        log.info("Initializing frozen encoder model for encoder-decoder GRPO")
+        self._encoder_model = copy.deepcopy(self.model)
+        for param in self._encoder_model.parameters():
+            param.requires_grad = False
+        self._encoder_model.eval()
 
     def _compute_grpo_advantages(
         self,
@@ -432,12 +452,19 @@ class BaseFamilyLitModule(LightningModule):
             L_prompt = input_ids.shape[-1] if input_ids is not None else 0
             batch_size = max(self.grpo_max_tokens // (L + L_prompt), 1)
 
-        # Compute context KV cache once (with gradients for the policy)
+        # Compute context KV cache once.
+        # If a frozen encoder exists, use it (no gradients through prompt);
+        # otherwise use the trainable model (original behaviour).
         has_context = input_ids is not None and input_ids.numel() > 0
         past_key_values = None
         if has_context:
-            ctx_outputs = self.model(input_ids=input_ids, use_cache=True)
-            past_key_values = ctx_outputs.past_key_values
+            if self._encoder_model is not None:
+                with torch.no_grad():
+                    ctx_outputs = self._encoder_model(input_ids=input_ids, use_cache=True)
+                past_key_values = ctx_outputs.past_key_values
+            else:
+                ctx_outputs = self.model(input_ids=input_ids, use_cache=True)
+                past_key_values = ctx_outputs.past_key_values
 
         all_log_probs: List[torch.Tensor] = []
         all_masks: List[torch.Tensor] = []
@@ -500,6 +527,100 @@ class BaseFamilyLitModule(LightningModule):
             all_masks.append(mask)
 
         return torch.cat(all_log_probs, dim=0), torch.cat(all_masks, dim=0)
+
+    def _grpo_step_from_batch(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Lightning-style GRPO adapter: convert a reward-bearing batch into
+        the arguments expected by :meth:`grpo_step_from_rewards` and invoke it.
+
+        The batch is expected to contain:
+            - ``input_ids``:     ``(1, L_context)`` prompt/context tokens.
+            - ``completion_ids``: ``(1, N, L_completion)`` variant tokens.
+              A leading SEP may optionally be present on each completion.
+            - ``rewards`` or ``DMS_scores``: ``(1, N)`` or ``(N,)`` reward scores.
+
+        Because the Lightning batch does not carry pre-computed "old" policy
+        log-probs, we compute them here with :func:`torch.no_grad` — this is
+        on-policy GRPO (old == new at step start), so the PPO clip is a
+        no-op and the objective reduces to the advantage-weighted policy
+        gradient.
+
+        Returns the scalar loss for Lightning to backprop through, and
+        logs the per-step metrics from ``grpo_step_from_rewards`` under
+        the ``train/`` namespace.
+        """
+        input_ids = batch["input_ids"]
+        completion_ids = batch["completion_ids"]  # (1, N, L_completion)
+
+        raw_rewards = batch.get("rewards", batch.get("DMS_scores"))
+        assert raw_rewards is not None, (
+            "GRPO training requires 'rewards' or 'DMS_scores' in batch"
+        )
+        rewards = (
+            raw_rewards[0].float() if raw_rewards.dim() > 1 else raw_rewards.float()
+        )
+
+        # (1, N, L_comp) → (N, L_comp) and strip a leading SEP if present
+        # (grpo_step_from_rewards re-prepends its own SEP to each completion).
+        generated_tokens = completion_ids[0]
+        sep_id = self.tokenizer.sep_token_id
+        if (
+            generated_tokens.shape[1] > 0
+            and int(generated_tokens[0, 0].item()) == sep_id
+        ):
+            generated_tokens = generated_tokens[:, 1:]
+
+        # Build the completion-ids tensor that _compute_per_token_log_probs_for_grpo
+        # expects — exactly the same shape the reward-agnostic core builds internally.
+        gen_on_device = generated_tokens.to(self.device)
+        sep_prefix = torch.full(
+            (gen_on_device.shape[0], 1),
+            sep_id,
+            dtype=gen_on_device.dtype,
+            device=self.device,
+        )
+        comp_for_lp = torch.cat([sep_prefix, gen_on_device], dim=1).unsqueeze(0)
+        input_ids_dev = input_ids.to(self.device)
+        if (
+            input_ids_dev.shape[1] > 0
+            and int(input_ids_dev[0, -1].item()) == sep_id
+        ):
+            input_ids_for_scoring = input_ids_dev[:, :-1]
+        else:
+            input_ids_for_scoring = input_ids_dev
+
+        with torch.no_grad():
+            old_per_token_lps, old_per_token_mask = (
+                self._compute_per_token_log_probs_for_grpo(
+                    input_ids=input_ids_for_scoring,
+                    completion_ids=comp_for_lp,
+                )
+            )
+
+        loss, metrics = self.grpo_step_from_rewards(
+            input_ids=input_ids,
+            generated_tokens=generated_tokens,
+            old_per_token_lps=old_per_token_lps,
+            old_per_token_mask=old_per_token_mask,
+            rewards=rewards,
+        )
+
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                self.log(
+                    f"train/{k}",
+                    float(v),
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    sync_dist=True,
+                )
+
+        if hasattr(self, "log_train_dataset_sample_counts"):
+            self.log_train_dataset_sample_counts(batch)
+
+        return loss
 
     def grpo_step_from_rewards(
         self,
@@ -624,97 +745,6 @@ class BaseFamilyLitModule(LightningModule):
 
         return total_loss, metrics
 
-    def grpo_training_step(
-        self, batch: Dict[str, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        """GRPO training step for batches with pre-computed rewards.
-
-        Accepts any batch containing pre-computed reward scores alongside
-        variant sequences.  Implements Group Relative Policy Optimization:
-        1. Compute advantages from ALL rewards (before subsampling)
-        2. Sample a group of variants for gradient computation
-        3. Compute log-likelihoods for sampled variants under current policy
-        4. Update policy to increase likelihood of high-reward variants
-
-        Args:
-            batch: Dictionary containing:
-                - input_ids: MSA context tokens (1, L_context)
-                - completion_ids: Variant tokens (1, N, L_completion)
-                - rewards: Reward scores (1, N) or (N,).
-                  Also accepts ``DMS_scores`` as a backward-compatible alias.
-            batch_idx: Batch index
-
-        Returns:
-            loss: GRPO loss value
-        """
-        input_ids = batch["input_ids"]  # (1, L_context)
-        completion_ids = batch["completion_ids"]  # (1, N, L_completion)
-
-        # Accept either "rewards" or "DMS_scores" key
-        raw_rewards = batch.get("rewards", batch.get("DMS_scores"))
-        assert raw_rewards is not None, (
-            "GRPO training requires 'rewards' or 'DMS_scores' in batch"
-        )
-
-        # Flatten batch dimension for scores
-        rewards = raw_rewards[0].float() if raw_rewards.dim() > 1 else raw_rewards.float()
-        N = rewards.shape[0]
-
-        # Compute advantages from ALL rewards (before subsampling)
-        all_advantages = self._compute_grpo_advantages(rewards)
-
-        # Sample a group of variants if we have more than grpo_group_size
-        if N > self.grpo_group_size:
-            group_indices = random.sample(range(N), self.grpo_group_size)
-            advantages = all_advantages[group_indices]
-        else:
-            group_indices = list(range(N))
-            advantages = all_advantages
-
-        # Compute log-likelihoods for the group with gradients
-        log_likelihoods = self._compute_variant_log_likelihoods_for_grpo(
-            input_ids=input_ids,
-            completion_ids=completion_ids,
-            group_indices=group_indices,
-        )
-
-        # GRPO loss: -E[advantage * log_prob]
-        grpo_loss = -(advantages.to(log_likelihoods.device) * log_likelihoods).mean()
-
-        # Optional KL regularization to reference model
-        kl_loss = torch.tensor(0.0, device=grpo_loss.device)
-        if self.grpo_use_reference_model and self.grpo_beta > 0:
-            ref_model = self._get_reference_model()
-            if ref_model is not None:
-                kl_loss = self._compute_token_level_kl_divergence(
-                    ref_model=ref_model,
-                    input_ids=input_ids,
-                    completion_ids=completion_ids,
-                    group_indices=group_indices,
-                )
-
-        total_loss = grpo_loss + self.grpo_beta * kl_loss
-
-        # Logging
-        self.log("train/grpo_loss", grpo_loss.item(),
-                 on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train/grpo_kl_loss",
-                 kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
-                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("train/grpo_total_loss", total_loss.item(),
-                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("train/grpo_mean_advantage", advantages.mean().item(),
-                 on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log("train/grpo_mean_log_likelihood", log_likelihoods.mean().item(),
-                 on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log("train/grpo_group_size", float(len(group_indices)),
-                 on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-
-        # Log dataset sample counts if available
-        if hasattr(self, 'log_train_dataset_sample_counts'):
-            self.log_train_dataset_sample_counts(batch)
-
-        return total_loss
 
     def _compute_token_level_kl_divergence(
         self,
@@ -779,7 +809,15 @@ class BaseFamilyLitModule(LightningModule):
                 ref_context_outputs = ref_model(input_ids=input_ids, use_cache=True)
                 ref_past_key_values = ref_context_outputs.past_key_values
 
-            policy_context_outputs = self.model(input_ids=input_ids, use_cache=True)
+            if self._encoder_model is not None:
+                with torch.no_grad():
+                    policy_context_outputs = self._encoder_model(
+                        input_ids=input_ids, use_cache=True
+                    )
+            else:
+                policy_context_outputs = self.model(
+                    input_ids=input_ids, use_cache=True
+                )
             policy_past_key_values = policy_context_outputs.past_key_values
 
         all_kl_divs = []
@@ -1008,6 +1046,16 @@ class BaseFamilyLitModule(LightningModule):
                     "(will be recreated in on_fit_start)"
                 )
                 for k in ref_model_keys:
+                    del state_dict[k]
+
+            # Remove _encoder_model keys - it's recreated dynamically
+            encoder_model_keys = [k for k in state_dict.keys() if k.startswith("_encoder_model.")]
+            if encoder_model_keys:
+                log.info(
+                    f"Removing {len(encoder_model_keys)} _encoder_model keys from checkpoint "
+                    "(will be recreated via init_encoder_decoder_grpo)"
+                )
+                for k in encoder_model_keys:
                     del state_dict[k]
 
         if self.override_optimizer_on_load:
